@@ -12,21 +12,68 @@ import { convex } from "./convex-client.js";
 import { broadcast } from "./broadcast.js";
 import { sendTelegram } from "./telegram.js";
 
-// Read OAuth token from Claude Code credentials — always reads from disk so a
-// token refreshed by the Claude CLI between turns is picked up immediately.
-function getAuthToken(): string {
+const CREDS_PATH = `${os.homedir()}/.claude/.credentials.json`;
+const OAUTH_TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token";
+const OAUTH_CLIENT_ID = "https://claude.ai/oauth/claude-code-client-metadata";
+const REFRESH_BUFFER_MS = 5 * 60 * 1000; // refresh when within 5 min of expiry
+
+function readCredentials(): any {
+  return JSON.parse(fs.readFileSync(CREDS_PATH, "utf-8"));
+}
+
+async function refreshAccessToken(refreshToken: string): Promise<string> {
+  console.log("[auth] refreshing OAuth access token via platform.claude.com");
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: OAUTH_CLIENT_ID,
+  });
+  const res = await fetch(OAUTH_TOKEN_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!res.ok) {
+    const err = await res.text().catch(() => res.statusText);
+    throw new Error(`OAuth refresh failed ${res.status}: ${err}`);
+  }
+  const data = await res.json() as any;
+  const newAccessToken: string = data.access_token;
+  const expiresIn: number = data.expires_in ?? 3600;
+  if (!newAccessToken) throw new Error("OAuth refresh returned no access_token");
+
+  // Write updated token back to credentials file
+  const creds = readCredentials();
+  creds.claudeAiOauth.accessToken = newAccessToken;
+  creds.claudeAiOauth.expiresAt = Date.now() + expiresIn * 1000;
+  if (data.refresh_token) creds.claudeAiOauth.refreshToken = data.refresh_token;
+  fs.writeFileSync(CREDS_PATH, JSON.stringify(creds, null, 2));
+  console.log(`[auth] token refreshed — new expiry in ${Math.round(expiresIn / 60)}min`);
+  return newAccessToken;
+}
+
+// Returns a valid OAuth access token, proactively refreshing before expiry.
+// Always reads from disk so Claude CLI refreshes are immediately visible.
+async function getAuthToken(): Promise<string> {
   if (process.env.ANTHROPIC_API_KEY) {
     return process.env.ANTHROPIC_API_KEY;
   }
   try {
-    const credsPath = `${os.homedir()}/.claude/.credentials.json`;
-    const creds = JSON.parse(fs.readFileSync(credsPath, "utf-8"));
-    const token = creds?.claudeAiOauth?.accessToken;
-    if (token) return token;
-  } catch {
-    // ignore
+    const creds = readCredentials();
+    const oauth = creds?.claudeAiOauth;
+    if (!oauth?.accessToken) throw new Error("no accessToken");
+
+    const expiresAt: number = oauth.expiresAt ?? 0;
+    const needsRefresh = expiresAt - Date.now() < REFRESH_BUFFER_MS;
+
+    if (needsRefresh && oauth.refreshToken) {
+      return await refreshAccessToken(oauth.refreshToken);
+    }
+    return oauth.accessToken;
+  } catch (err) {
+    throw new Error(`No auth token found: ${err}. Set ANTHROPIC_API_KEY or run \`claude\` to login.`);
   }
-  throw new Error("No auth token found. Set ANTHROPIC_API_KEY or run `claude` to login.");
 }
 
 function buildAnthropicClient(token: string): Anthropic {
@@ -112,7 +159,7 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
   let reply = "";
 
   try {
-    let token = getAuthToken();
+    let token = await getAuthToken();
     log(`auth token — prefix=${token.slice(0, 14)}… isOAuth=${token.startsWith("sk-ant-oat")}`);
     log(`Anthropic API → START model=${model}`);
     const apiStart = Date.now();
@@ -126,11 +173,13 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
         messages,
       });
     } catch (err: any) {
-      // 401 means the OAuth token expired. The Claude CLI refreshes it in the
-      // credentials file — re-read from disk and retry exactly once.
+      // 401 safety net: force-refresh (bypasses the 5-min buffer) and retry once.
       if (err?.status === 401) {
-        log(`401 on first attempt — re-reading credentials and retrying`);
-        token = getAuthToken();
+        log(`401 on first attempt — force-refreshing token`);
+        const creds = readCredentials();
+        const rt = creds?.claudeAiOauth?.refreshToken;
+        if (!rt) throw err;
+        token = await refreshAccessToken(rt);
         log(`retry token — prefix=${token.slice(0, 14)}…`);
         response = await buildAnthropicClient(token).messages.create({
           model,
