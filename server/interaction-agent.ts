@@ -12,13 +12,12 @@ import { convex } from "./convex-client.js";
 import { broadcast } from "./broadcast.js";
 import { sendTelegram } from "./telegram.js";
 
-// Read OAuth token from Claude Code credentials
+// Read OAuth token from Claude Code credentials — always reads from disk so a
+// token refreshed by the Claude CLI between turns is picked up immediately.
 function getAuthToken(): string {
-  // First check for explicit API key
   if (process.env.ANTHROPIC_API_KEY) {
     return process.env.ANTHROPIC_API_KEY;
   }
-  // Fall back to Claude Code OAuth token
   try {
     const credsPath = `${os.homedir()}/.claude/.credentials.json`;
     const creds = JSON.parse(fs.readFileSync(credsPath, "utf-8"));
@@ -28,6 +27,15 @@ function getAuthToken(): string {
     // ignore
   }
   throw new Error("No auth token found. Set ANTHROPIC_API_KEY or run `claude` to login.");
+}
+
+function buildAnthropicClient(token: string): Anthropic {
+  return new Anthropic({
+    apiKey: token,
+    ...(token.startsWith("sk-ant-oat") ? {
+      defaultHeaders: { "anthropic-beta": "oauth-2025-04-20" },
+    } : {}),
+  });
 }
 
 const INTERACTION_SYSTEM = `You are Boop, a personal AI agent the user texts on Telegram.
@@ -104,25 +112,37 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
   let reply = "";
 
   try {
-    const token = getAuthToken();
-    log(`auth token ok — prefix=${token.slice(0, 14)}… isOAuth=${token.startsWith("sk-ant-oat")}`);
-
-    const client = new Anthropic({
-      apiKey: token,
-      ...(token.startsWith("sk-ant-oat") ? {
-        defaultHeaders: { "anthropic-beta": "oauth-2025-04-20" },
-      } : {}),
-    });
-
+    let token = getAuthToken();
+    log(`auth token — prefix=${token.slice(0, 14)}… isOAuth=${token.startsWith("sk-ant-oat")}`);
     log(`Anthropic API → START model=${model}`);
     const apiStart = Date.now();
 
-    const response = await client.messages.create({
-      model,
-      max_tokens: 1024,
-      system: INTERACTION_SYSTEM,
-      messages,
-    });
+    let response: Anthropic.Message;
+    try {
+      response = await buildAnthropicClient(token).messages.create({
+        model,
+        max_tokens: 1024,
+        system: INTERACTION_SYSTEM,
+        messages,
+      });
+    } catch (err: any) {
+      // 401 means the OAuth token expired. The Claude CLI refreshes it in the
+      // credentials file — re-read from disk and retry exactly once.
+      if (err?.status === 401) {
+        log(`401 on first attempt — re-reading credentials and retrying`);
+        token = getAuthToken();
+        log(`retry token — prefix=${token.slice(0, 14)}…`);
+        response = await buildAnthropicClient(token).messages.create({
+          model,
+          max_tokens: 1024,
+          system: INTERACTION_SYSTEM,
+          messages,
+        });
+        log(`retry succeeded`);
+      } else {
+        throw err;
+      }
+    }
 
     const textBlock = response.content.find((b) => b.type === "text");
     reply = textBlock?.type === "text" ? textBlock.text.trim() : "(no reply)";
