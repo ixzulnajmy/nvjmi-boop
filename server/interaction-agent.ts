@@ -57,7 +57,22 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
   const tag = opts.turnTag ?? turnId.slice(-6);
   const log = (msg: string) => console.log(`[turn ${tag}] ${msg}`);
 
-  // Store user message in Convex
+  // Load conversation history BEFORE saving current message so we get a clean
+  // prior-context snapshot without needing to slice the just-saved message out.
+  const history = await convex.query(api.messages.recent, {
+    conversationId: opts.conversationId,
+    limit: 10,
+  });
+
+  // Build messages array: prior history + current user message
+  const messages: Anthropic.MessageParam[] = [
+    ...history
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+    { role: "user", content: opts.content },
+  ];
+
+  // Persist user message to Convex (after query so it doesn't appear in history above)
   await convex.mutation(api.messages.send, {
     conversationId: opts.conversationId,
     role: "user",
@@ -65,23 +80,6 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
     turnId,
   });
   broadcast("user_message", { conversationId: opts.conversationId, content: opts.content });
-
-  // Load conversation history
-  const history = await convex.query(api.messages.recent, {
-    conversationId: opts.conversationId,
-    limit: 10,
-  });
-
-  // Build messages array for API
-  const messages: Anthropic.MessageParam[] = history
-    .slice(0, -1) // exclude the message we just saved
-    .map((m) => ({
-      role: m.role as "user" | "assistant",
-      content: m.content,
-    }));
-
-  // Add current message
-  messages.push({ role: "user", content: opts.content });
 
   const model = process.env.BOOP_MODEL ?? "claude-haiku-4-5-20251001";
   const turnStart = Date.now();

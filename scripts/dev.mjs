@@ -74,6 +74,8 @@ const NOISE_TRIGGERS = [
   /Error: write EPIPE/,
   /Error: read ECONNRESET/,
   /AggregateError \[ECONNREFUSED\]/,
+  // Vite's WS proxy emits this format when the boop server restarts
+  /Error: connect ECONNREFUSED 127\.0\.0\.1/,
 ];
 const STACK_LINE = /^\s+at\s/;
 
@@ -117,11 +119,11 @@ function run(name, cmd, args, readyPattern) {
 }
 
 // --- ngrok URL banner: poll local API after launch ----------------------
-async function waitForNgrokUrl(timeoutMs = 15000) {
+async function waitForNgrokUrl(apiPort = 4040, timeoutMs = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {
-      const res = await fetch("http://127.0.0.1:4040/api/tunnels");
+      const res = await fetch(`http://127.0.0.1:${apiPort}/api/tunnels`);
       if (res.ok) {
         const data = await res.json();
         const https = data.tunnels?.find((t) => t.proto === "https")?.public_url;
@@ -196,7 +198,7 @@ run("upstream", "node", ["scripts/check-upstream.mjs"]);
 const serverChild = run(
   "server",
   "npx",
-  ["tsx", "watch", "server/index.ts"],
+  ["tsx", "watch", "--ignore", "convex/_generated/**", "server/index.ts"],
   /listening on :/,
 );
 const convexChild = run(
@@ -219,8 +221,16 @@ if (useNgrok && ngrokInstalled) {
     ? ["http", port, `--domain=${ngrokDomain}`, "--log=stdout", "--log-format=term", "--log-level=info"]
     : ["http", port, "--log=stdout", "--log-format=term", "--log-level=info"];
   const ngrokChild = run("ngrok", "ngrok", args);
-  children.push(ngrokChild);
-  ngrokUrlReady = waitForNgrokUrl().catch(() => null);
+  // Do NOT push to children — ngrok is non-fatal. If the tunnel endpoint is
+  // already online (ERR_NGROK_334), ngrok exits 1 but the existing tunnel
+  // keeps routing to localhost:${port}. Killing tsx+convex over this is wrong.
+  ngrokChild.on("exit", (code) => {
+    if (code !== 0 && code !== null) {
+      console.log(`${C.ngrok}ngrok${C.reset} │ exited (code ${code}) — existing tunnel may still be active.`);
+    }
+  });
+  // Poll both 4040 (default) and 4041 (fallback when 4040 is taken by older instance)
+  ngrokUrlReady = waitForNgrokUrl(4040).catch(() => waitForNgrokUrl(4041)).catch(() => null);
 }
 
 // Wait for all the core services to be ready before printing the banner,
