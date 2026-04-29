@@ -4,7 +4,7 @@ import cors from "cors";
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { addClient } from "./broadcast.js";
-import { parseInbound, sendTypingIndicator, registerWebhook, isDuplicate } from "./telegram.js";
+import { parseInbound, sendTypingIndicator, verifyAndRegisterWebhook, isDuplicate } from "./telegram.js";
 import { handleUserMessage } from "./interaction-agent.js";
 import { loadIntegrations } from "./integrations/registry.js";
 import { startCleanupLoop } from "./memory/clean.js";
@@ -121,7 +121,7 @@ async function main() {
     console.log(`  websocket   WS   ws://localhost:${port}/ws`);
     // ADD after the last console.log inside server.listen:
     const publicUrl = process.env.PUBLIC_URL;
-    if (publicUrl) registerWebhook(publicUrl);
+    if (publicUrl) verifyAndRegisterWebhook(publicUrl);
   });
 }
 

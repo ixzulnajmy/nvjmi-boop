@@ -135,24 +135,60 @@ export async function sendTypingIndicator(chatId: string): Promise<void> {
   });
 }
 
-// ─── Register webhook with Telegram ──────────────────────────────────────────
-// Call this once on startup to tell Telegram where to send updates
+// ─── Register / verify webhook with Telegram ─────────────────────────────────
 
 export async function registerWebhook(publicUrl: string): Promise<void> {
   const webhookUrl = `${publicUrl}/telegram/webhook`;
+  console.log(`[tg:webhook-reg] calling setWebhook url=${webhookUrl}`);
 
   const res = await fetch(`${TELEGRAM_API}/setWebhook`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: webhookUrl }),
+    body: JSON.stringify({ url: webhookUrl, allowed_updates: ['message'] }),
+    signal: AbortSignal.timeout(10_000),
   });
 
   const data = await res.json() as any;
   if (data.ok) {
-    console.log(`[telegram] webhook registered: ${webhookUrl}`);
+    console.log(`[tg:webhook-reg] set ok — ${webhookUrl}`);
   } else {
-    console.error('[telegram] webhook registration failed:', data);
+    console.error(`[tg:webhook-reg] setWebhook FAILED:`, data);
   }
+}
+
+// Reads the current webhook state from Telegram and only calls setWebhook when
+// the URL doesn't match. Prevents a stale or empty URL from silently persisting
+// across server restarts.
+export async function verifyAndRegisterWebhook(publicUrl: string): Promise<void> {
+  const expectedUrl = `${publicUrl}/telegram/webhook`;
+
+  let currentUrl = '';
+  try {
+    const res = await fetch(`${TELEGRAM_API}/getWebhookInfo`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    const data = await res.json() as any;
+    currentUrl = data.result?.url ?? '';
+    const pending = data.result?.pending_update_count ?? 0;
+    const lastErr = data.result?.last_error_message ?? null;
+    const lastErrDate = data.result?.last_error_date
+      ? new Date(data.result.last_error_date * 1000).toISOString()
+      : null;
+    console.log(
+      `[tg:webhook-reg] current="${currentUrl}" pending=${pending}` +
+      (lastErr ? ` last_error="${lastErr}" at=${lastErrDate}` : ''),
+    );
+  } catch (err) {
+    console.warn(`[tg:webhook-reg] getWebhookInfo failed:`, err);
+  }
+
+  if (currentUrl === expectedUrl) {
+    console.log(`[tg:webhook-reg] already correct — skipping setWebhook`);
+    return;
+  }
+
+  console.log(`[tg:webhook-reg] mismatch (got "${currentUrl}") — re-registering`);
+  await registerWebhook(publicUrl);
 }
 
 // ─── Dedup ────────────────────────────────────────────────────────────────────
