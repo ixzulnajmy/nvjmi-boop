@@ -55,39 +55,57 @@ function randomId(prefix: string): string {
 export async function handleUserMessage(opts: HandleOpts): Promise<string> {
   const turnId = randomId("turn");
   const tag = opts.turnTag ?? turnId.slice(-6);
-  const log = (msg: string) => console.log(`[turn ${tag}] ${msg}`);
+  const t0 = Date.now();
+  const ms = () => `+${Date.now() - t0}ms`;
+  const log = (msg: string) => console.log(`[turn ${tag}] ${ms()} ${msg}`);
 
-  // Load conversation history BEFORE saving current message so we get a clean
-  // prior-context snapshot without needing to slice the just-saved message out.
-  const history = await convex.query(api.messages.recent, {
-    conversationId: opts.conversationId,
-    limit: 10,
-  });
+  log(`START convId=${opts.conversationId} text="${opts.content.slice(0, 60)}"`);
 
-  // Build messages array: prior history + current user message
+  // ── 1. Load prior history ────────────────────────────────────────────────
+  log("convex.query messages.recent → START");
+  let history: Awaited<ReturnType<typeof convex.query<typeof api.messages.recent>>>;
+  try {
+    history = await convex.query(api.messages.recent, {
+      conversationId: opts.conversationId,
+      limit: 10,
+    });
+  } catch (err) {
+    log(`convex.query FAILED: ${err}`);
+    throw err;
+  }
+  log(`convex.query done — ${history.length} messages in history`);
+
   const messages: Anthropic.MessageParam[] = [
     ...history
       .filter((m) => m.role === "user" || m.role === "assistant")
       .map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
     { role: "user", content: opts.content },
   ];
+  log(`messages array built — ${messages.length} entries (${messages.length - 1} history + 1 current)`);
 
-  // Persist user message to Convex (after query so it doesn't appear in history above)
-  await convex.mutation(api.messages.send, {
-    conversationId: opts.conversationId,
-    role: "user",
-    content: opts.content,
-    turnId,
-  });
+  // ── 2. Persist user message ──────────────────────────────────────────────
+  log("convex.mutation messages.send (user) → START");
+  try {
+    await convex.mutation(api.messages.send, {
+      conversationId: opts.conversationId,
+      role: "user",
+      content: opts.content,
+      turnId,
+    });
+  } catch (err) {
+    log(`convex.mutation (user) FAILED: ${err}`);
+    throw err;
+  }
+  log("convex.mutation messages.send (user) done");
   broadcast("user_message", { conversationId: opts.conversationId, content: opts.content });
 
+  // ── 3. Call Anthropic API ────────────────────────────────────────────────
   const model = process.env.BOOP_MODEL ?? "claude-haiku-4-5-20251001";
-  const turnStart = Date.now();
-
   let reply = "";
 
   try {
     const token = getAuthToken();
+    log(`auth token ok — prefix=${token.slice(0, 14)}… isOAuth=${token.startsWith("sk-ant-oat")}`);
 
     const client = new Anthropic({
       apiKey: token,
@@ -96,7 +114,8 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
       } : {}),
     });
 
-    log(`calling ${model}...`);
+    log(`Anthropic API → START model=${model}`);
+    const apiStart = Date.now();
 
     const response = await client.messages.create({
       model,
@@ -108,48 +127,54 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
     const textBlock = response.content.find((b) => b.type === "text");
     reply = textBlock?.type === "text" ? textBlock.text.trim() : "(no reply)";
 
-    const durationMs = Date.now() - turnStart;
-    const inputTokens = response.usage.input_tokens;
-    const outputTokens = response.usage.output_tokens;
-    log(`done in ${durationMs}ms — ${inputTokens}in/${outputTokens}out`);
+    const apiMs = Date.now() - apiStart;
+    log(`Anthropic API done — ${response.usage.input_tokens}in/${response.usage.output_tokens}out in ${apiMs}ms`);
 
-    // Record usage
     await convex.mutation(api.usageRecords.record, {
       source: "dispatcher",
       conversationId: opts.conversationId,
       turnId,
       model,
-      inputTokens,
-      outputTokens,
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
-      costUsd: 0, // haiku is effectively free at personal scale
-      durationMs,
-    }).catch(() => {}); // non-fatal
+      costUsd: 0,
+      durationMs: apiMs,
+    }).catch((err) => log(`usageRecords.record non-fatal: ${err}`));
 
   } catch (err) {
-    console.error(`[turn ${tag}] API call failed:`, err);
+    log(`Anthropic API FAILED: ${err}`);
     reply = "Sorry — I hit an error processing that. Try again in a moment.";
   }
 
   reply = reply || "(no reply)";
 
-  // Store assistant reply
-  await convex.mutation(api.messages.send, {
-    conversationId: opts.conversationId,
-    role: "assistant",
-    content: reply,
-    turnId,
-  });
+  // ── 4. Persist assistant reply ───────────────────────────────────────────
+  log("convex.mutation messages.send (assistant) → START");
+  try {
+    await convex.mutation(api.messages.send, {
+      conversationId: opts.conversationId,
+      role: "assistant",
+      content: reply,
+      turnId,
+    });
+  } catch (err) {
+    log(`convex.mutation (assistant) FAILED: ${err}`);
+  }
+  log("convex.mutation messages.send (assistant) done");
   broadcast("assistant_message", { conversationId: opts.conversationId, content: reply });
 
-  // Send ack via Telegram if conversationId starts with tg:
+  // ── 5. Deliver via Telegram ──────────────────────────────────────────────
   if (opts.conversationId.startsWith("tg:")) {
     const chatId = opts.conversationId.slice(3);
+    log(`sendTelegram → START chatId=${chatId}`);
     await sendTelegram(chatId, reply).catch((err) => {
-      console.error(`[turn ${tag}] telegram send failed:`, err);
+      log(`sendTelegram FAILED: ${err}`);
     });
+    log("sendTelegram done");
   }
 
+  log(`DONE — total ${ms()}`);
   return reply;
 }

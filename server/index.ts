@@ -34,20 +34,30 @@ async function main() {
   });
 
   app.post("/telegram/webhook", async (req, res) => {
+    const wt0 = Date.now();
+    const wms = () => `+${Date.now() - wt0}ms`;
+    console.log(`[tg:webhook] POST received — body keys: ${Object.keys(req.body ?? {}).join(", ")}`);
     res.sendStatus(200);
     try {
       const msg = parseInbound(req.body);
-      if (!msg) return;
-      if (isDuplicate(msg.messageId)) return;
+      if (!msg) { console.log(`[tg:webhook] ${wms()} parseInbound → null, dropping`); return; }
+
+      console.log(`[tg:webhook] ${wms()} parsed msgId=${msg.messageId} chatId=${msg.from}`);
+
+      if (isDuplicate(msg.messageId)) { console.log(`[tg:webhook] ${wms()} duplicate, dropping`); return; }
+
+      console.log(`[tg:webhook] ${wms()} sendTypingIndicator → START`);
       await sendTypingIndicator(msg.from);
-      console.log(`[telegram] incoming from ${msg.from}: ${msg.text}`);
+      console.log(`[tg:webhook] ${wms()} sendTypingIndicator done`);
+
+      console.log(`[tg:webhook] ${wms()} handleUserMessage → START`);
       const reply = await handleUserMessage({
         conversationId: `tg:${msg.from}`,
         content: msg.text,
       });
-      console.log(`[telegram] reply: ${reply}`);
+      console.log(`[tg:webhook] ${wms()} handleUserMessage done — reply="${reply.slice(0, 80)}"`);
     } catch (err) {
-      console.error(`[telegram] handler error:`, err);
+      console.error(`[tg:webhook] ${wms()} UNCAUGHT ERROR:`, err);
     }
   });
   app.use("/composio", createComposioRouter());

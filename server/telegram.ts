@@ -31,23 +31,26 @@ export function handleWebhookVerification(
 export function parseInbound(body: any): InboundMessage | null {
   try {
     const message = body?.message;
-    if (!message) return null;
-
-    // Only handle text messages for now
-    // TODO: handle voice messages (transcribe), photos, documents
-    if (!message.text) {
-      console.log(`[telegram] skipping non-text message type`);
+    if (!message) {
+      console.log(`[tg:parse] no message field in body (update_id=${body?.update_id})`);
       return null;
     }
 
-    return {
-      from: String(message.chat.id),  // chat_id — unique per user
+    if (!message.text) {
+      console.log(`[tg:parse] non-text message — chat=${message.chat?.id} type=${message.chat?.type}`);
+      return null;
+    }
+
+    const parsed = {
+      from: String(message.chat.id),
       text: message.text,
       messageId: message.message_id,
       timestamp: message.date * 1000,
     };
+    console.log(`[tg:parse] ok — chatId=${parsed.from} msgId=${parsed.messageId} text="${parsed.text.slice(0, 60)}"`);
+    return parsed;
   } catch (err) {
-    console.error('[telegram] failed to parse inbound:', err);
+    console.error('[tg:parse] threw:', err);
     return null;
   }
 }
@@ -83,50 +86,52 @@ export async function sendTelegram(to: string, text: string): Promise<void> {
 }
 
 async function sendSingleMessage(chatId: string, text: string): Promise<void> {
-  const body = {
-    chat_id: chatId,
-    text: text,
-    parse_mode: 'Markdown',  // Telegram supports Markdown natively
-  };
+  console.log(`[tg:send] → chatId=${chatId} len=${text.length}`);
+  const t0 = Date.now();
 
   const res = await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' }),
+    signal: AbortSignal.timeout(15_000),
   });
+
+  console.log(`[tg:send] HTTP ${res.status} in ${Date.now() - t0}ms`);
 
   if (!res.ok) {
     const err = await res.json().catch(() => res.statusText);
-    // If Markdown parsing fails, retry as plain text
     if ((err as any)?.description?.includes('parse')) {
-      console.warn('[telegram] Markdown parse error, retrying as plain text');
+      console.warn('[tg:send] Markdown parse error, retrying plain text');
       await fetch(`${TELEGRAM_API}/sendMessage`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, text }),
+        signal: AbortSignal.timeout(15_000),
       });
       return;
     }
-    console.error('[telegram] send failed:', JSON.stringify(err));
+    console.error('[tg:send] failed:', JSON.stringify(err));
     throw new Error(`Telegram send failed: ${res.status}`);
   }
 
   const data = await res.json() as any;
-  console.log(`[telegram] → sent ${text.length} chars to ${chatId} (msgId: ${data.result?.message_id})`);
+  console.log(`[tg:send] ok — delivered msgId=${data.result?.message_id} total=${Date.now() - t0}ms`);
 }
 
 // ─── Typing indicator — Telegram supports this natively ──────────────────────
 
 export async function sendTypingIndicator(chatId: string): Promise<void> {
+  console.log(`[tg:typing] → chatId=${chatId}`);
+  const t0 = Date.now();
   await fetch(`${TELEGRAM_API}/sendChatAction`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      action: 'typing',
-    }),
+    body: JSON.stringify({ chat_id: chatId, action: 'typing' }),
+    signal: AbortSignal.timeout(8_000),
+  }).then(r => {
+    console.log(`[tg:typing] done ${r.status} in ${Date.now() - t0}ms`);
   }).catch(err => {
-    console.warn('[telegram] typing indicator failed:', err.message);
+    console.warn(`[tg:typing] failed after ${Date.now() - t0}ms:`, err.message);
   });
 }
 
@@ -155,8 +160,12 @@ export async function registerWebhook(publicUrl: string): Promise<void> {
 const seenMessageIds = new Set<number>();
 
 export function isDuplicate(messageId: number): boolean {
-  if (seenMessageIds.has(messageId)) return true;
+  if (seenMessageIds.has(messageId)) {
+    console.log(`[tg:dedup] DUPLICATE dropped — msgId=${messageId} (seen ${seenMessageIds.size} ids in memory)`);
+    return true;
+  }
   seenMessageIds.add(messageId);
+  console.log(`[tg:dedup] new — msgId=${messageId} (now tracking ${seenMessageIds.size} ids)`);
   if (seenMessageIds.size > 1000) {
     const first = seenMessageIds.values().next().value;
     if (first !== undefined) seenMessageIds.delete(first);
